@@ -21,49 +21,64 @@
  * モードを切り替える際には、一度モーターを disable し、再度 enable するのが安全です。
  * このサンプルでは、モード切替時に自動でゼロ点をリセットしています。
  */
-#include <RP2040PIO_CAN.h>
 
-#include <DAMIAO.h>
-#include <DMUtils.h>
+// ▼▼▼ Select Board ▼▼▼ 使うボードだけコメントアウトを外す
+#define USE_BOARD_ARDUINO_R4
+// #define USE_BOARD_PICO
+// #define USE_BOARD_ESP32
+
+#if defined(USE_BOARD_ARDUINO_R4)
+#include <Arduino_CAN.h>
+// R4はCAN_TX/CAN_RXピンが固定のため、ピン設定は不要
+
+#elif defined(USE_BOARD_ESP32)
+#include <ESP32_TWAI.h>  // https://github.com/eyr1n/ESP32_TWAI
+// 使用するマイコンに合わせてピン番号を変更してください
+const gpio_num_t CAN_TX_PIN = 22;
+const gpio_num_t CAN_RX_PIN = 21;
+
+#elif defined(USE_BOARD_PICO)
+#include <RP2040PIO_CAN.h>  //https://github.com/eyr1n/RP2040PIO_CAN
+// 使用するマイコンに合わせてピン番号を変更してください
+const uint32_t CAN_TX_PIN = 0;  // 連続してなくてもいい
+const uint32_t CAN_RX_PIN = 1;  // GP1とGP3みたいな組み合わせでも動く
+
+#else
+#error "ボードが選択されていません。ファイルの先頭で USE_BOARD_... のどれか1つを有効にしてください。"
+#endif
+
+//CANライブラリよりも下で呼び出す api/HardwareCAN.hが無いって言われる
+#include <DAMIAO.h>   // DAMIAOモーター制御ライブラリ
+#include <DMUtils.h>  // ユーティリティ関数置き場
 
 using namespace damiao;
 
 // =============================================
 // ユーザー設定項目 (User Settings)
 // =============================================
-const uint8_t CAN_TX_PIN = 0;
-const uint8_t CAN_RX_PIN = 1;
-
-const uint32_t MASTER_ID = 0x00;
-const uint32_t MOTOR_SLAVE_ID = 0x09;
+const uint32_t MASTER_ID = 0x00;  // モーターのMasterID
+const uint32_t SLAVE_ID = 0x09;   // モーターのSlaveID
 // =============================================
 
-// モーターオブジェクト
-Motor motor1(MASTER_ID, MOTOR_SLAVE_ID);
+// モーターオブジェクトの作成
+Motor motor1(MASTER_ID, SLAVE_ID);
 
 // 現在の制御モードを管理するための変数
 static Mode currentState = Mode::POS_VEL;
-
 // 最後にモードを切り替えた時刻
 static unsigned long lastSwitchMillis = 0;
 // モードを切り替える間隔 (ミリ秒)
 const unsigned long SWITCH_INTERVAL_MS = 10000UL;
 
-// 最後にフィードバックを表示した時刻
-static unsigned long lastFeedbackMillis = 0;
-const unsigned long FEEDBACK_INTERVAL_MS = 500UL;
-
-
-// モーターのフィードバック情報を表示する関数
-void printFeedback() {
-  Status status = motor1.getStatus();
-  Mode mode = motor1.getMode();
-  float pos = motor1.getPosition();
-  float vel = motor1.getVelocity();
-  float tau = motor1.getTorque();
+void printFeedback(Motor& motor) {
+  Status status = motor.getStatus();
+  Mode mode = motor.getMode();
+  float pos = motor.getPosition();
+  float vel = motor.getVelocity();
+  float tau = motor.getTorque();
 
   Serial.print("[FB] ID:");
-  Serial.print(motor1.getSlaveId());
+  Serial.print(motor.getSlaveId());
   Serial.print(" Status:");
   Serial.print(statusToString(status));
   Serial.print(" Mode:");
@@ -77,14 +92,13 @@ void printFeedback() {
 }
 
 // 次の制御モードに切り替える関数
-void switchToNextState() {
+void switchToNextState(Motor& motor) {
   Serial.println("\n--------------------");
   Serial.print("Switching mode from ");
-  Serial.print(modeToString(motor1.getMode()));
+  Serial.print(modeToString(motor.getMode()));
   Serial.print(" to ");
 
-  // 安全のため、モード切替前に一度モーターを無効化
-  motor1.disable();
+  motor.disable();  // 安全のため、モード切替前に一度モーターを無効化
   delay(100);
 
   // モードを順番に切り替える
@@ -107,43 +121,51 @@ void switchToNextState() {
   }
   Serial.println(modeToString(currentState));
   Serial.println("--------------------");
-
-  // 新しいモードを設定
-  motor1.setControlMode(currentState);
-
-  // ゼロ点をリセット
-  motor1.setZeroPosition();
-
-  // モーターを再度有効化
-  motor1.enable();
+  motor.setControlMode(currentState);  // 新しいモードを設定
+  motor.setZeroPosition();             // ゼロ点をリセット
+  motor.enable();                      // モーターを再度有効化
 }
 
 
 void setup() {
   Serial.begin(115200);
+  // シリアルモニタが起動するまで最大5秒待機
   while (!Serial && millis() < 5000);
-  Serial.println("\n--- Advanced Mode Switching Example ---");
+  Serial.println("\n--- Single Motor MIT Control Example ---");
 
+  // 1. CAN通信の初期化
+  bool can_ok = false;
+#if defined(USE_BOARD_ARDUINO_R4)
+  can_ok = CAN.begin(CanBitRate::BR_1000k);
+
+#elif defined(USE_BOARD_ESP32)
+  can_ok = CAN.begin(CanBitRate::BR_1000k, CAN_TX_PIN, CAN_RX_PIN);
+
+#elif defined(USE_BOARD_PICO)
   CAN.setTX(CAN_TX_PIN);
   CAN.setRX(CAN_RX_PIN);
-  if (!CAN.begin(CanBitRate::BR_1000k)) {
+  can_ok = CAN.begin(CanBitRate::BR_1000k);
+#endif
+
+  if (can_ok) {
+    Serial.println("CAN bus initialized successfully.");
+  } else {
     Serial.println("CAN bus initialization failed!");
-    while (1);
+    while (1);  // CAN通信が開始できない場合はここで停止
   }
-  motor1.setCAN(&CAN);
-  delay(100);
+  motor1.setCAN(&CAN);  // モーターにCANインスタンスを渡す
+  motor1.disable();     // 念のためモーターを無効化
+
+  // 2. モーターの各種パラメータを取得
+  motor1.initialize();
 
   // 最初のモードを設定して有効化
   Serial.print("Starting with mode: ");
   Serial.println(modeToString(currentState));
   motor1.setControlMode(currentState);
-  delay(100);
   motor1.setZeroPosition();
-  delay(100);
   motor1.enable();
-
-  // 最初の切り替え時刻を記録
-  lastSwitchMillis = millis();
+  lastSwitchMillis = millis();  // 最初の切り替え時刻を記録
 }
 
 void loop() {
@@ -153,7 +175,7 @@ void loop() {
   unsigned long now = millis();
   if (now - lastSwitchMillis >= SWITCH_INTERVAL_MS) {
     lastSwitchMillis = now;
-    switchToNextState();
+    switchToNextState(motor1);
   }
 
   // 現在のモードに応じた制御コマンドを送信
@@ -169,9 +191,9 @@ void loop() {
       break;
 
     case Mode::MIT:
-      // 【インピーダンス制御】目標位置 0, 速度 0, KP 5.0, KD 2.0, トルク 0
+      // 【インピーダンス制御】目標位置 0, 速度 0, KP 1.0, KD 1.0, トルク 0
       // この設定では、モーターはバネダンパの挙動を示します。
-      motor1.sendMIT(0.0f, 0.0f, 5.0f, 2.0f, 0.0f);
+      motor1.sendMIT(0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
       break;
 
     default:
@@ -180,10 +202,11 @@ void loop() {
   }
 
   // 定期的にフィードバックを表示
+  static unsigned long lastFeedbackMillis = 0;
+  const unsigned long FEEDBACK_INTERVAL_MS = 100UL;
   if (now - lastFeedbackMillis >= FEEDBACK_INTERVAL_MS) {
     lastFeedbackMillis = now;
-    printFeedback();
+    printFeedback(motor1);
   }
-
-  delay(10);  // 少し長めのdelayでシリアル出力を見やすくする
+  delay(1);
 }
